@@ -1,0 +1,346 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#f4f7fb" />
+    <meta
+      name="description"
+      content="在本机完成视频转写、中文字幕翻译、声音克隆和中文配音。"
+    />
+    <title>声译 · AI 视频中文化</title>
+    <link rel="stylesheet" href="./styles.css" />
+    <script src="./app.js" defer></script>
+  </head>
+  <body>
+    <div class="ambient ambient-one" aria-hidden="true"></div>
+    <div class="ambient ambient-two" aria-hidden="true"></div>
+
+    <header class="topbar">
+      <a class="brand" href="#" aria-label="声译首页">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 32 32" role="img">
+            <path d="M6 17.2h3.5l2.1-6.4 4.1 13.1 3.5-10.4 2 5.2H26" />
+          </svg>
+        </span>
+        <span>声译</span>
+        <span class="brand-en">LOCAL DUB STUDIO</span>
+      </a>
+      <div class="local-badge" title="媒体文件和模型推理默认留在本机">
+        <span class="status-dot"></span>
+        本地处理
+      </div>
+    </header>
+
+    <main class="page-shell">
+      <section class="hero" aria-labelledby="page-title">
+        <p class="eyebrow">AI VIDEO LOCALIZATION</p>
+        <h1 id="page-title">让英文视频，<span>自然地说中文。</span></h1>
+        <p class="hero-copy">
+          一次完成本地转写、上下文翻译、声音克隆、时间轴对齐与字幕合成。
+        </p>
+        <div class="flow-pills" aria-label="处理流程摘要">
+          <span>Whisper 转写</span><i></i><span>自然翻译</span><i></i><span>克隆配音</span><i></i><span>视频合成</span>
+        </div>
+      </section>
+
+      <div class="workspace-grid">
+        <section class="panel input-panel" aria-labelledby="create-title">
+          <div class="panel-heading">
+            <div>
+              <p class="section-kicker">NEW PROJECT</p>
+              <h2 id="create-title">创建中文化任务</h2>
+            </div>
+            <span class="step-hint">设置约 1 分钟</span>
+          </div>
+
+          <form id="job-form" novalidate>
+            <fieldset class="form-section source-section">
+              <legend><span>01</span>选择视频</legend>
+              <div class="source-tabs" role="tablist" aria-label="视频来源">
+                <button
+                  class="source-tab is-active"
+                  type="button"
+                  role="tab"
+                  aria-selected="true"
+                  aria-controls="youtube-source"
+                  data-source="youtube"
+                >
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21.6 7.2a2.8 2.8 0 0 0-2-2C17.9 4.7 12 4.7 12 4.7s-5.9 0-7.6.5a2.8 2.8 0 0 0-2 2A29 29 0 0 0 2 12a29 29 0 0 0 .4 4.8 2.8 2.8 0 0 0 2 2c1.7.5 7.6.5 7.6.5s5.9 0 7.6-.5a2.8 2.8 0 0 0 2-2A29 29 0 0 0 22 12a29 29 0 0 0-.4-4.8Z"/><path class="play" d="m10 15.2 5.2-3.2L10 8.8v6.4Z"/></svg>
+                  YouTube 链接
+                </button>
+                <button
+                  class="source-tab"
+                  type="button"
+                  role="tab"
+                  aria-selected="false"
+                  aria-controls="local-source"
+                  data-source="local"
+                >
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4.8A1.8 1.8 0 0 1 5.8 3h7.4L20 9.8v9.4a1.8 1.8 0 0 1-1.8 1.8H5.8A1.8 1.8 0 0 1 4 19.2V4.8Z"/><path d="M13 3v7h7M9.2 15.7l2-2 1.8 1.8 1.8-2.1"/></svg>
+                  本地视频
+                </button>
+              </div>
+
+              <div id="youtube-source" class="source-pane" role="tabpanel">
+                <label class="field-label" for="youtube-url">YouTube 视频 URL</label>
+                <div class="url-field">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7.5.5l2-2a5 5 0 0 0-7-7l-1.1 1.1M14 11a5 5 0 0 0-7.5-.5l-2 2a5 5 0 0 0 7 7l1.1-1.1"/></svg>
+                  <input
+                    id="youtube-url"
+                    name="youtube_url"
+                    type="url"
+                    inputmode="url"
+                    autocomplete="url"
+                    placeholder="https://www.youtube.com/watch?v=..."
+                  />
+                </div>
+                <p class="field-help">支持 yt-dlp 可访问的视频地址；下载进度会显示在右侧。</p>
+              </div>
+
+              <div id="local-source" class="source-pane" role="tabpanel" hidden>
+                <label id="video-dropzone" class="dropzone" for="video-file">
+                  <input id="video-file" name="video_file" type="file" accept="video/*,.mkv,.webm,.mov,.mp4,.m4v" />
+                  <span class="drop-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24"><path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M5 14v4.5A1.5 1.5 0 0 0 6.5 20h11a1.5 1.5 0 0 0 1.5-1.5V14"/></svg>
+                  </span>
+                  <span class="drop-title">拖入视频，或点击选择</span>
+                  <span class="drop-note">MP4、MOV、MKV、WebM</span>
+                  <span id="video-file-name" class="selected-file" hidden></span>
+                </label>
+              </div>
+            </fieldset>
+
+            <fieldset class="form-section">
+              <legend><span>02</span>识别与翻译</legend>
+              <div class="field-grid two-columns">
+                <label class="control-label">
+                  <span>源语言</span>
+                  <select name="source_language" id="source-language">
+                    <option value="auto">自动检测</option>
+                    <option value="en">English</option>
+                  </select>
+                </label>
+                <label class="control-label">
+                  <span>目标语言</span>
+                  <select name="target_language" id="target-language">
+                    <option value="zh-CN">简体中文</option>
+                  </select>
+                </label>
+                <label class="control-label">
+                  <span>Whisper 模型</span>
+                  <input name="whisper_model" id="whisper-model" value="turbo" autocomplete="off" />
+                </label>
+                <label class="control-label">
+                  <span>翻译服务</span>
+                  <select name="translation_provider" id="translation-provider">
+                    <option value="ollama">Ollama（本地）</option>
+                    <option value="openai">OpenAI-compatible</option>
+                  </select>
+                </label>
+              </div>
+              <label class="control-label full-control">
+                <span>翻译模型</span>
+                <input name="translation_model" id="translation-model" value="qwen2.5:14b" autocomplete="off" />
+              </label>
+            </fieldset>
+
+            <fieldset class="form-section">
+              <legend><span>03</span>中文配音</legend>
+              <label class="switch-row primary-switch" for="enable-dubbing">
+                <span>
+                  <strong>生成中文配音</strong>
+                  <small>使用 CosyVoice3 克隆说话人音色</small>
+                </span>
+                <input id="enable-dubbing" name="enable_dubbing" type="checkbox" checked />
+                <span class="switch" aria-hidden="true"></span>
+              </label>
+
+              <div id="voice-settings" class="nested-settings">
+                <span class="field-label">参考声音</span>
+                <div class="choice-cards three-choices" role="radiogroup" aria-label="参考声音来源">
+                  <label>
+                    <input type="radio" name="voice_mode" value="auto" checked />
+                    <span><strong>自动选择</strong><small>推荐 5–12 秒清晰语音</small></span>
+                  </label>
+                  <label>
+                    <input type="radio" name="voice_mode" value="segment" />
+                    <span><strong>指定片段</strong><small>使用转写 segment ID</small></span>
+                  </label>
+                  <label>
+                    <input type="radio" name="voice_mode" value="upload" />
+                    <span><strong>上传声音</strong><small>使用已授权 WAV</small></span>
+                  </label>
+                </div>
+
+                <div id="segment-reference" class="conditional-control" hidden>
+                  <label class="control-label">
+                    <span>Segment ID</span>
+                    <input name="reference_segment_id" id="reference-segment-id" type="number" min="0" step="1" placeholder="例如 12" />
+                  </label>
+                  <p>将在转写完成后使用对应原文与音频片段。</p>
+                </div>
+
+                <div id="upload-reference" class="conditional-control upload-reference" hidden>
+                  <label class="compact-upload" for="reference-audio">
+                    <input id="reference-audio" name="reference_audio" type="file" accept="audio/wav,audio/x-wav,audio/mpeg,audio/mp4,.wav,.mp3,.m4a,.flac" />
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V5m0 0L8 9m4-4 4 4M5 15v3.5A1.5 1.5 0 0 0 6.5 20h11a1.5 1.5 0 0 0 1.5-1.5V15"/></svg>
+                    <span id="reference-file-name">选择参考音频</span>
+                  </label>
+                  <label class="control-label reference-text-control">
+                    <span>参考音频原文</span>
+                    <textarea name="reference_text" id="reference-text" rows="2" placeholder="准确填写录音中说出的原文"></textarea>
+                  </label>
+                </div>
+
+                <p class="consent-note">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 4.5 6v5.2c0 4.5 3.2 8.3 7.5 9.8 4.3-1.5 7.5-5.3 7.5-9.8V6L12 3Z"/><path d="m9 12 2 2 4-4"/></svg>
+                  请仅克隆本人、已获授权或你有权处理的声音。
+                </p>
+              </div>
+            </fieldset>
+
+            <fieldset class="form-section output-settings">
+              <legend><span>04</span>混音与字幕</legend>
+              <div class="setting-stack">
+                <label class="switch-row" for="preserve-background">
+                  <span>
+                    <strong>保留背景音</strong>
+                    <small>压低原音轨并叠加中文配音</small>
+                  </span>
+                  <input id="preserve-background" name="preserve_background" type="checkbox" checked />
+                  <span class="switch" aria-hidden="true"></span>
+                </label>
+                <div class="inline-setting">
+                  <span><strong>人声分离</strong><small>Demucs 更干净，但耗时更长</small></span>
+                  <select name="separation_mode" id="separation-mode">
+                    <option value="fast">Fast</option>
+                    <option value="demucs">Demucs</option>
+                  </select>
+                </div>
+                <div class="inline-setting">
+                  <span><strong>字幕输出</strong><small>软字幕可开关，压制字幕兼容性更好</small></span>
+                  <select name="subtitle_mode" id="subtitle-mode">
+                    <option value="both">软字幕 + 压制字幕</option>
+                    <option value="soft">仅软字幕</option>
+                    <option value="burn">仅压制字幕</option>
+                  </select>
+                </div>
+                <label class="inline-setting" for="subtitle-font">
+                  <span><strong>中文字幕字体</strong><small>需为本机 FFmpeg 可用字体</small></span>
+                  <input name="subtitle_font" id="subtitle-font" value="PingFang SC" />
+                </label>
+              </div>
+            </fieldset>
+
+            <div id="form-error" class="form-error" role="alert" hidden></div>
+            <button id="submit-button" class="submit-button" type="submit">
+              <span class="button-label">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+                开始处理
+              </span>
+              <span class="button-loader" aria-hidden="true"></span>
+            </button>
+          </form>
+        </section>
+
+        <aside class="panel progress-panel" aria-labelledby="progress-title">
+          <div class="panel-heading progress-heading">
+            <div>
+              <p class="section-kicker">PROCESS</p>
+              <h2 id="progress-title">任务进度</h2>
+            </div>
+            <span id="job-status-badge" class="job-status status-idle">等待任务</span>
+          </div>
+
+          <div id="empty-state" class="empty-state">
+            <div class="empty-visual" aria-hidden="true">
+              <span class="orbit orbit-one"></span>
+              <span class="orbit orbit-two"></span>
+              <svg viewBox="0 0 48 48"><path d="M10 26h6l3-9 6 19 5-15 3 7h5"/></svg>
+            </div>
+            <h3>准备就绪</h3>
+            <p>填写左侧选项并开始处理后，这里会实时显示九个阶段、日志与输出文件。</p>
+            <div class="privacy-line"><span></span>视频默认仅在你的设备上处理</div>
+          </div>
+
+          <div id="job-view" class="job-view" hidden>
+            <div class="job-meta-row">
+              <span>任务 <code id="job-id">—</code></span>
+              <div class="job-actions">
+                <button id="refresh-button" class="icon-button" type="button" title="刷新任务" aria-label="刷新任务">
+                  <svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 5v6h-6"/></svg>
+                </button>
+                <button id="cancel-button" class="text-button danger" type="button">取消</button>
+                <button id="retry-button" class="text-button" type="button" hidden>继续 / 重试</button>
+              </div>
+            </div>
+
+            <div class="overall-progress">
+              <div class="progress-labels">
+                <strong id="current-step-label">正在准备…</strong>
+                <span id="progress-percent">0%</span>
+              </div>
+              <div
+                class="progress-track"
+                role="progressbar"
+                aria-label="任务总进度"
+                aria-valuemin="0"
+                aria-valuemax="100"
+                aria-valuenow="0"
+              >
+                <span id="progress-fill"></span>
+              </div>
+            </div>
+
+            <div class="stats-grid">
+              <div><span>当前阶段</span><strong id="step-count">0 / 9</strong></div>
+              <div><span>配音片段</span><strong id="segment-count">—</strong></div>
+              <div><span>运行时间</span><strong id="elapsed-time">00:00</strong></div>
+            </div>
+
+            <ol id="pipeline-steps" class="pipeline-steps">
+              <li data-step="1"><span class="step-marker">1</span><div><strong>下载 / 导入视频</strong><small>准备源媒体</small></div><span class="step-state">等待</span></li>
+              <li data-step="2"><span class="step-marker">2</span><div><strong>提取音频</strong><small>生成标准 WAV</small></div><span class="step-state">等待</span></li>
+              <li data-step="3"><span class="step-marker">3</span><div><strong>Whisper 转写</strong><small>识别原文与时间戳</small></div><span class="step-state">等待</span></li>
+              <li data-step="4"><span class="step-marker">4</span><div><strong>整理字幕</strong><small>按语义合并片段</small></div><span class="step-state">等待</span></li>
+              <li data-step="5"><span class="step-marker">5</span><div><strong>翻译中文</strong><small>上下文感知翻译</small></div><span class="step-state">等待</span></li>
+              <li data-step="6"><span class="step-marker">6</span><div><strong>中文配音</strong><small>逐片段声音克隆</small></div><span class="step-state">等待</span></li>
+              <li data-step="7"><span class="step-marker">7</span><div><strong>时间轴同步</strong><small>控制语速并补齐停顿</small></div><span class="step-state">等待</span></li>
+              <li data-step="8"><span class="step-marker">8</span><div><strong>音轨混合</strong><small>叠加背景与中文人声</small></div><span class="step-state">等待</span></li>
+              <li data-step="9"><span class="step-marker">9</span><div><strong>合成视频</strong><small>写入字幕与最终媒体</small></div><span class="step-state">等待</span></li>
+            </ol>
+
+            <section class="log-section" aria-labelledby="log-heading">
+              <div class="subheading-row">
+                <h3 id="log-heading">实时日志</h3>
+                <button id="clear-log-button" class="quiet-button" type="button">清空显示</button>
+              </div>
+              <div id="log-output" class="log-output" role="log" aria-live="polite">
+                <div class="log-placeholder">等待服务端消息…</div>
+              </div>
+            </section>
+
+            <section id="result-section" class="result-section" aria-labelledby="result-heading" hidden>
+              <div class="subheading-row">
+                <h3 id="result-heading">处理结果</h3>
+                <span class="complete-chip">已完成</span>
+              </div>
+              <div id="video-preview" class="video-preview" hidden>
+                <video id="result-video" controls preload="metadata"></video>
+              </div>
+              <div id="artifact-list" class="artifact-list"></div>
+            </section>
+          </div>
+        </aside>
+      </div>
+    </main>
+
+    <footer>
+      <span>声译 · Local-first AI dubbing</span>
+      <span>Whisper · Ollama · CosyVoice3 · FFmpeg</span>
+    </footer>
+
+    <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
+  </body>
+</html>
