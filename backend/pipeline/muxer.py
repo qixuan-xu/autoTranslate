@@ -6,7 +6,12 @@ import tempfile
 from pathlib import Path
 
 from backend.config import Settings
-from backend.pipeline.audio import commit_media_output, media_cache_is_valid
+from backend.pipeline.audio import (
+    build_media_cache_metadata,
+    commit_media_output,
+    file_content_fingerprint,
+    media_cache_is_valid,
+)
 from backend.pipeline.subtitle import read_srt
 from backend.utils.files import temporary_output_path
 from backend.utils.process import ProcessError, require_executable, run_process
@@ -23,10 +28,30 @@ async def mux_soft_subtitle(
     config: Settings,
 ) -> Path:
     required_streams = {"video", "audio", "subtitle"} if subtitle else {"video", "audio"}
+    cache_metadata = build_media_cache_metadata(
+        "soft-subtitle-mux",
+        inputs={
+            "video": file_content_fingerprint(video),
+            "audio": file_content_fingerprint(audio),
+            "subtitle": file_content_fingerprint(subtitle) if subtitle is not None else None,
+        },
+        parameters={
+            "video_codec": "copy",
+            "audio_codec": "aac",
+            "audio_bitrate": "192k",
+            "subtitle_codec": "mov_text" if subtitle is not None else None,
+            "subtitle_language": "zho" if subtitle is not None else None,
+            "subtitle_title": "简体中文" if subtitle is not None else None,
+            "subtitle_default": subtitle is not None,
+            "faststart": True,
+            "shortest": False,
+        },
+    )
     if await media_cache_is_valid(
         output,
         config,
         required_stream_types=required_streams,
+        expected_metadata=cache_metadata,
     ):
         return output
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -63,6 +88,7 @@ async def mux_soft_subtitle(
             output,
             config,
             required_stream_types=required_streams,
+            cache_metadata=cache_metadata,
         )
     finally:
         pending.unlink(missing_ok=True)
@@ -91,10 +117,41 @@ async def mux_burned_subtitle(
     fallback_srt: Path | None = None,
     font_name: str = "PingFang SC",
 ) -> Path:
+    font_candidate = Path(font_name).expanduser()
+    cache_metadata = build_media_cache_metadata(
+        "burned-subtitle-mux",
+        inputs={
+            "video": file_content_fingerprint(video),
+            "audio": file_content_fingerprint(audio),
+            "ass_subtitle": file_content_fingerprint(ass_subtitle),
+            "fallback_srt": (
+                file_content_fingerprint(fallback_srt)
+                if fallback_srt is not None
+                else None
+            ),
+            "explicit_font_file": (
+                file_content_fingerprint(font_candidate)
+                if font_candidate.is_file()
+                else None
+            ),
+        },
+        parameters={
+            "font_name": font_name,
+            "renderer": "ffmpeg-ass-with-pillow-fallback",
+            "video_codec": "libx264",
+            "preset": "medium",
+            "crf": 18,
+            "audio_codec": "aac",
+            "audio_bitrate": "192k",
+            "faststart": True,
+            "shortest": True,
+        },
+    )
     if await media_cache_is_valid(
         output,
         config,
         required_stream_types={"video", "audio"},
+        expected_metadata=cache_metadata,
     ):
         return output
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -150,6 +207,7 @@ async def mux_burned_subtitle(
             output,
             config,
             required_stream_types={"video", "audio"},
+            cache_metadata=cache_metadata,
         )
     finally:
         pending.unlink(missing_ok=True)

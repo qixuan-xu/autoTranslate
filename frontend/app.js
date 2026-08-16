@@ -7,12 +7,20 @@
   const SUCCESS_STATES = new Set(["completed", "complete", "succeeded", "success"]);
   const FAILURE_STATES = new Set(["failed", "error"]);
   const CANCELLED_STATES = new Set(["cancelled", "canceled"]);
+  const REFERENCE_WAIT_STATES = new Set([
+    "awaiting_reference",
+    "waiting_for_reference",
+    "reference_required",
+  ]);
   const STATUS_LABELS = {
     idle: "等待任务",
     pending: "等待开始",
     queued: "排队中",
     running: "处理中",
     processing: "处理中",
+    awaiting_reference: "等待选择声音",
+    waiting_for_reference: "等待选择声音",
+    reference_required: "等待选择声音",
     completed: "已完成",
     complete: "已完成",
     succeeded: "已完成",
@@ -57,11 +65,11 @@
     videoDropzone: document.querySelector("#video-dropzone"),
     translationProvider: document.querySelector("#translation-provider"),
     translationModel: document.querySelector("#translation-model"),
+    ollamaModelList: document.querySelector("#ollama-model-list"),
     dubbing: document.querySelector("#enable-dubbing"),
     voiceSettings: document.querySelector("#voice-settings"),
     voiceModes: [...document.querySelectorAll('input[name="voice_mode"]')],
     segmentReference: document.querySelector("#segment-reference"),
-    referenceSegmentId: document.querySelector("#reference-segment-id"),
     uploadReference: document.querySelector("#upload-reference"),
     referenceAudio: document.querySelector("#reference-audio"),
     referenceFileName: document.querySelector("#reference-file-name"),
@@ -82,6 +90,10 @@
     stepCount: document.querySelector("#step-count"),
     segmentCount: document.querySelector("#segment-count"),
     elapsed: document.querySelector("#elapsed-time"),
+    referencePicker: document.querySelector("#reference-picker"),
+    referencePickerState: document.querySelector("#reference-picker-state"),
+    referenceSegmentList: document.querySelector("#reference-segment-list"),
+    referencePickerRefresh: document.querySelector("#reference-picker-refresh"),
     steps: [...document.querySelectorAll("#pipeline-steps li")],
     logOutput: document.querySelector("#log-output"),
     clearLogs: document.querySelector("#clear-log-button"),
@@ -104,6 +116,13 @@
     lastStep: 0,
     files: [],
     seenLogIds: new Set(),
+    ollamaModels: [],
+    ollamaDefault: "qwen2.5:14b",
+    referencePickerJobId: null,
+    referenceSegments: [],
+    referenceSegmentsLoaded: false,
+    referenceLoading: false,
+    referenceSubmitting: false,
   };
 
   function setSource(source) {
@@ -134,12 +153,45 @@
   }
 
   function updateModelHint() {
-    const wasOllamaDefault = dom.translationModel.value.trim() === "qwen2.5:14b";
-    const wasOpenAIDefault = dom.translationModel.value.trim() === "gpt-4.1-mini";
+    const currentModel = dom.translationModel.value.trim();
+    const wasOllamaDefault = currentModel === state.ollamaDefault
+      || state.ollamaModels.includes(currentModel)
+      || currentModel === "qwen2.5:14b";
+    const wasOpenAIDefault = currentModel === "gpt-4.1-mini";
     if (dom.translationProvider.value === "openai" && wasOllamaDefault) {
       dom.translationModel.value = "gpt-4.1-mini";
     } else if (dom.translationProvider.value === "ollama" && wasOpenAIDefault) {
-      dom.translationModel.value = "qwen2.5:14b";
+      dom.translationModel.value = state.ollamaDefault;
+    }
+  }
+
+  async function loadEnvironment() {
+    try {
+      const response = await fetch("/api/health", { headers: { Accept: "application/json" } });
+      if (!response.ok) return;
+      const payload = await response.json();
+      const ollama = payload?.ollama || {};
+      state.ollamaModels = Array.isArray(ollama.models) ? ollama.models : [];
+      const configured = String(ollama.configured_model || "").trim();
+      state.ollamaDefault = state.ollamaModels.includes(configured)
+        ? configured
+        : (state.ollamaModels[0] || configured || "qwen2.5:14b");
+      dom.ollamaModelList.replaceChildren(
+        ...state.ollamaModels.map((name) => {
+          const option = document.createElement("option");
+          option.value = name;
+          return option;
+        }),
+      );
+      if (
+        dom.translationProvider.value === "ollama"
+        && state.ollamaModels.length
+        && !state.ollamaModels.includes(dom.translationModel.value.trim())
+      ) {
+        dom.translationModel.value = state.ollamaDefault;
+      }
+    } catch (_) {
+      // The create endpoint performs the authoritative readiness check.
     }
   }
 
@@ -161,9 +213,6 @@
 
     if (dom.dubbing.checked) {
       const voiceMode = dom.voiceModes.find((input) => input.checked)?.value;
-      if (voiceMode === "segment" && dom.referenceSegmentId.value === "") {
-        return "指定片段模式需要填写 Segment ID。";
-      }
       if (voiceMode === "upload" && !dom.referenceAudio.files[0]) {
         return "上传声音模式需要选择参考音频。";
       }
@@ -202,7 +251,6 @@
     data.append("preserve_background", String(dom.form.elements.namedItem("preserve_background").checked));
     const voiceMode = dom.voiceModes.find((input) => input.checked)?.value || "auto";
     data.append("voice_mode", voiceMode);
-    if (voiceMode === "segment") data.append("reference_segment_id", dom.referenceSegmentId.value);
     if (voiceMode === "upload") {
       data.append("reference_audio", dom.referenceAudio.files[0]);
       data.append("reference_text", dom.referenceText.value.trim());
@@ -228,7 +276,13 @@
       if (!id) throw new Error("服务端未返回任务 ID。");
 
       beginJob(String(id), payload);
-      toast("任务已创建，正在开始处理。", "success");
+      const voiceMode = dom.voiceModes.find((input) => input.checked)?.value || "auto";
+      toast(
+        voiceMode === "segment"
+          ? "任务已创建；转写完成后会请你选择参考声音。"
+          : "任务已创建，正在开始处理。",
+        "success",
+      );
     } catch (error) {
       showFormError(error.message || "无法创建任务，请确认后端服务已启动。");
     } finally {
@@ -238,6 +292,7 @@
 
   function beginJob(id, initialPayload = {}) {
     closeEvents();
+    resetReferencePicker();
     state.jobId = id;
     state.jobStatus = "queued";
     state.startedAt = parseDate(initialPayload.started_at ?? initialPayload.created_at) ?? Date.now();
@@ -263,18 +318,35 @@
 
   function connectEvents() {
     closeEvents();
-    if (!state.jobId || TERMINAL_STATES.has(normalizeStatus(state.jobStatus))) return;
+    if (
+      !state.jobId
+      || TERMINAL_STATES.has(normalizeStatus(state.jobStatus))
+      || isAwaitingReference()
+    ) return;
 
     const events = new EventSource(`${API_ROOT}/${encodeURIComponent(state.jobId)}/events`);
     state.eventSource = events;
 
     events.onopen = () => appendLog("已连接实时进度。", "info", true);
     events.onmessage = (event) => handleEventData(event.data, "message");
-    ["update", "progress", "status", "log", "complete", "completed", "failed"].forEach((type) => {
+    [
+      "update",
+      "progress",
+      "status",
+      "log",
+      "awaiting_reference",
+      "reference_required",
+      "complete",
+      "completed",
+      "failed",
+    ].forEach((type) => {
       events.addEventListener(type, (event) => handleEventData(event.data, type));
     });
     events.onerror = () => {
-      if (TERMINAL_STATES.has(normalizeStatus(state.jobStatus))) {
+      if (
+        TERMINAL_STATES.has(normalizeStatus(state.jobStatus))
+        || isAwaitingReference()
+      ) {
         closeEvents();
         return;
       }
@@ -342,7 +414,13 @@
     if (!state.jobId) return;
     dom.retry.disabled = true;
     try {
-      const response = await fetch(`${API_ROOT}/${encodeURIComponent(state.jobId)}/retry`, { method: "POST" });
+      const retryData = new FormData();
+      retryData.append("translation_provider", dom.translationProvider.value);
+      retryData.append("translation_model", dom.translationModel.value.trim());
+      const response = await fetch(`${API_ROOT}/${encodeURIComponent(state.jobId)}/retry`, {
+        method: "POST",
+        body: retryData,
+      });
       const payload = await parseResponse(response);
       if (!response.ok) throw new Error(apiError(payload, `重试失败（HTTP ${response.status}）`));
       state.startedAt = Date.now();
@@ -358,9 +436,246 @@
     }
   }
 
+  function isAwaitingReference(status = state.jobStatus) {
+    return REFERENCE_WAIT_STATES.has(normalizeStatus(status));
+  }
+
+  function resetReferencePicker() {
+    state.referencePickerJobId = null;
+    state.referenceSegments = [];
+    state.referenceSegmentsLoaded = false;
+    state.referenceLoading = false;
+    state.referenceSubmitting = false;
+    dom.referencePicker.hidden = true;
+    dom.referenceSegmentList.replaceChildren();
+    dom.referencePickerState.hidden = false;
+    dom.referencePickerState.classList.remove("is-error");
+    dom.referencePickerState.textContent = "正在读取转写片段…";
+    dom.referencePickerRefresh.hidden = true;
+  }
+
+  function renderReferencePicker(status) {
+    const awaiting = isAwaitingReference(status);
+    dom.referencePicker.hidden = !awaiting;
+    if (!awaiting || !state.jobId) return;
+
+    if (state.referencePickerJobId !== state.jobId) {
+      state.referencePickerJobId = state.jobId;
+      state.referenceSegments = [];
+      state.referenceSegmentsLoaded = false;
+      state.referenceLoading = false;
+      state.referenceSubmitting = false;
+      dom.referenceSegmentList.replaceChildren();
+      void loadReferenceSegments();
+    }
+  }
+
+  async function loadReferenceSegments({ force = false } = {}) {
+    if (!state.jobId || !isAwaitingReference() || state.referenceSubmitting) return;
+    if (state.referenceLoading || (!force && state.referenceSegmentsLoaded)) return;
+
+    const jobId = state.jobId;
+    state.referencePickerJobId = jobId;
+    state.referenceLoading = true;
+    state.referenceSegmentsLoaded = false;
+    dom.referenceSegmentList.replaceChildren();
+    dom.referencePickerState.hidden = false;
+    dom.referencePickerState.classList.remove("is-error");
+    dom.referencePickerState.textContent = "正在读取转写片段…";
+    dom.referencePickerRefresh.hidden = true;
+
+    try {
+      const response = await fetch(
+        `${API_ROOT}/${encodeURIComponent(jobId)}/segments`,
+        { cache: "no-store", headers: { Accept: "application/json" } },
+      );
+      const payload = await parseResponse(response);
+      if (!response.ok) {
+        throw new Error(apiError(payload, `读取片段失败（HTTP ${response.status}）`));
+      }
+      if (state.jobId !== jobId) return;
+      state.referenceSegments = normalizeReferenceSegments(payload);
+      state.referenceSegmentsLoaded = true;
+      renderReferenceSegments();
+    } catch (error) {
+      if (state.jobId !== jobId) return;
+      state.referenceSegments = [];
+      dom.referencePickerState.hidden = false;
+      dom.referencePickerState.classList.add("is-error");
+      dom.referencePickerState.textContent = error.message || "无法读取参考声音片段。";
+      dom.referencePickerRefresh.hidden = false;
+    } finally {
+      if (state.jobId === jobId) state.referenceLoading = false;
+    }
+  }
+
+  function normalizeReferenceSegments(payload) {
+    const values = Array.isArray(payload)
+      ? payload
+      : payload?.segments
+        ?? payload?.items
+        ?? payload?.data?.segments
+        ?? payload?.transcript?.segments
+        ?? [];
+    if (!Array.isArray(values)) return [];
+
+    return values.map((item, index) => {
+      const id = Number(item?.id ?? item?.segment_id ?? index);
+      const start = Number(item?.start ?? item?.start_time ?? 0);
+      const end = Number(item?.end ?? item?.end_time ?? start);
+      return {
+        id,
+        start,
+        end,
+        text: String(item?.text ?? item?.original_text ?? item?.transcript ?? "").trim(),
+      };
+    }).filter((item) => (
+      Number.isInteger(item.id)
+      && item.id >= 0
+      && Number.isFinite(item.start)
+      && Number.isFinite(item.end)
+      && item.end > item.start
+    ));
+  }
+
+  function renderReferenceSegments() {
+    dom.referenceSegmentList.replaceChildren();
+    dom.referencePickerState.classList.remove("is-error");
+    if (!state.referenceSegments.length) {
+      dom.referencePickerState.hidden = false;
+      dom.referencePickerState.textContent = "没有找到可选片段。可刷新任务后重新加载。";
+      dom.referencePickerRefresh.hidden = false;
+      return;
+    }
+
+    dom.referencePickerState.hidden = true;
+    dom.referencePickerRefresh.hidden = true;
+    dom.referenceSegmentList.replaceChildren(
+      ...state.referenceSegments.map(createReferenceSegmentOption),
+    );
+  }
+
+  function createReferenceSegmentOption(segment) {
+    const item = document.createElement("div");
+    item.className = "reference-segment-item";
+    item.setAttribute("role", "listitem");
+
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "reference-segment-option";
+    button.dataset.segmentId = String(segment.id);
+    button.setAttribute("aria-label", `选择 segment ${segment.id} 作为参考声音`);
+
+    const meta = document.createElement("span");
+    meta.className = "reference-segment-meta";
+    meta.textContent = `#${segment.id} · ${formatSegmentTime(segment.start)} → ${formatSegmentTime(segment.end)} · ${(segment.end - segment.start).toFixed(1)} 秒`;
+
+    const action = document.createElement("span");
+    action.className = "reference-segment-action";
+    action.textContent = "选择这段";
+
+    const text = document.createElement("span");
+    text.className = "reference-segment-text";
+    text.textContent = segment.text || "（该片段没有可显示的原文）";
+
+    button.append(meta, action, text);
+    button.addEventListener("click", () => submitReferenceSegment(segment.id, button));
+    item.append(button);
+    return item;
+  }
+
+  async function submitReferenceSegment(segmentId, selectedButton) {
+    if (!state.jobId || !isAwaitingReference() || state.referenceSubmitting) return;
+    const jobId = state.jobId;
+    state.referenceSubmitting = true;
+    const buttons = [...dom.referenceSegmentList.querySelectorAll("button")];
+    buttons.forEach((button) => { button.disabled = true; });
+    selectedButton.classList.add("is-submitting");
+    const action = selectedButton.querySelector(".reference-segment-action");
+    if (action) action.textContent = "正在提交…";
+
+    try {
+      const data = new FormData();
+      data.append("segment_id", String(segmentId));
+      let response = await fetch(
+        `${API_ROOT}/${encodeURIComponent(jobId)}/reference`,
+        { method: "POST", body: data },
+      );
+      let payload = await parseResponse(response);
+      // The current contract is multipart.  Accept an older JSON-body backend
+      // during an in-place upgrade so an already-open page can still resume.
+      if (response.status === 422 && isReferenceBodyValidationError(payload)) {
+        response = await fetch(
+          `${API_ROOT}/${encodeURIComponent(jobId)}/reference`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ segment_id: segmentId }),
+          },
+        );
+        payload = await parseResponse(response);
+      }
+      if (!response.ok) {
+        throw new Error(apiError(payload, `提交参考片段失败（HTTP ${response.status}）`));
+      }
+      if (state.jobId !== jobId) return;
+
+      const returnedJob = payload?.job && typeof payload.job === "object"
+        ? payload.job
+        : payload;
+      if (returnedJob && typeof returnedJob === "object" && returnedJob.status) {
+        renderJob(returnedJob);
+      }
+      appendLog(`已选择 segment ${segmentId} 作为参考声音，任务继续。`, "info");
+      toast(`已选择 segment ${segmentId}，任务正在继续。`, "success");
+      await refreshJob({ quiet: true });
+      if (
+        !TERMINAL_STATES.has(normalizeStatus(state.jobStatus))
+        && !isAwaitingReference()
+      ) {
+        connectEvents();
+        startElapsedClock();
+      }
+    } catch (error) {
+      if (state.jobId !== jobId) return;
+      toast(error.message || "无法提交参考声音片段。", "error");
+      appendLog(error.message || "无法提交参考声音片段。", "error");
+    } finally {
+      if (state.jobId === jobId) {
+        state.referenceSubmitting = false;
+        if (isAwaitingReference()) renderReferenceSegments();
+      }
+    }
+  }
+
+  function isReferenceBodyValidationError(payload) {
+    if (!Array.isArray(payload?.detail)) return false;
+    return payload.detail.some((item) => (
+      Array.isArray(item?.loc)
+      && item.loc.includes("body")
+      && ["json_invalid", "model_attributes_type", "missing"].includes(item?.type)
+    ));
+  }
+
+  function formatSegmentTime(value) {
+    const totalMilliseconds = Math.max(0, Math.round(Number(value || 0) * 1000));
+    const totalSeconds = Math.floor(totalMilliseconds / 1000);
+    const milliseconds = totalMilliseconds % 1000;
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+    const base = hours
+      ? `${pad(hours)}:${pad(minutes)}:${pad(seconds)}`
+      : `${pad(minutes)}:${pad(seconds)}`;
+    return `${base}.${String(milliseconds).padStart(3, "0")}`;
+  }
+
   function renderJob(raw = {}) {
     const job = normalizeJob(raw);
-    if (job.id && !state.jobId) state.jobId = String(job.id);
+    if (job.id && state.jobId !== String(job.id)) {
+      resetReferencePicker();
+      state.jobId = String(job.id);
+    }
     if (job.status) state.jobStatus = job.status;
     if (job.startedAt) state.startedAt = job.startedAt;
     if (job.updatedAt && TERMINAL_STATES.has(normalizeStatus(job.status))) state.endedAt = job.updatedAt;
@@ -396,6 +711,8 @@
 
     renderSteps(step, status);
     renderActions(status);
+    renderReferencePicker(status);
+    if (isAwaitingReference(status)) closeEvents();
     if (state.files.length) renderArtifacts(state.files);
 
     if (TERMINAL_STATES.has(status)) {
@@ -479,6 +796,9 @@
         } else if (CANCELLED_STATES.has(status)) {
           item.classList.add("is-error");
           stepState.textContent = "取消";
+        } else if (REFERENCE_WAIT_STATES.has(status)) {
+          item.classList.add("is-active");
+          stepState.textContent = "等待选择";
         } else {
           item.classList.add("is-active");
           stepState.textContent = "进行中";
@@ -699,19 +1019,20 @@
     appendLog("正在恢复上次任务…", "info");
     await refreshJob({ quiet: true });
     if (!TERMINAL_STATES.has(normalizeStatus(state.jobStatus))) {
-      connectEvents();
+      if (!isAwaitingReference()) connectEvents();
       startElapsedClock();
     }
   }
 
   function normalizeStatus(value) {
-    return String(value || "idle").toLowerCase().replaceAll(" ", "_");
+    return String(value || "idle").toLowerCase().replaceAll(/[\s-]+/g, "_");
   }
 
   function statusClass(status) {
     if (SUCCESS_STATES.has(status)) return "completed";
     if (FAILURE_STATES.has(status)) return "failed";
     if (CANCELLED_STATES.has(status)) return "cancelled";
+    if (REFERENCE_WAIT_STATES.has(status)) return "awaiting-reference";
     if (status === "pending" || status === "queued") return "queued";
     if (status === "running" || status === "processing") return "running";
     return "idle";
@@ -809,6 +1130,9 @@
   });
   dom.form.addEventListener("submit", submitJob);
   dom.refresh.addEventListener("click", () => refreshJob());
+  dom.referencePickerRefresh.addEventListener("click", () => {
+    void loadReferenceSegments({ force: true });
+  });
   dom.cancel.addEventListener("click", cancelJob);
   dom.retry.addEventListener("click", retryJob);
   dom.clearLogs.addEventListener("click", () => {
@@ -817,5 +1141,5 @@
   window.addEventListener("beforeunload", closeEvents);
 
   updateVoiceControls();
-  restoreJob();
+  loadEnvironment().finally(restoreJob);
 })();

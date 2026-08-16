@@ -11,14 +11,18 @@ def test_job_store_persists_progress_and_logs(tmp_path):
         settings={"whisper_model": "turbo"},
         work_dir=str(tmp_path / "abc"),
     )
-    store.update_job("abc", status="running", progress=33.3, segments_done=2, segments_total=6)
-    store.add_log("abc", "Whisper started")
+    updated = store.update_job(
+        "abc", status="running", progress=33.3, segments_done=2, segments_total=6
+    )
+    log_entry = store.add_log("abc", "Whisper started")
 
     job = store.get_job("abc")
+    assert "logs" not in updated
     assert job["status"] == "running"
     assert job["progress"] == 33.3
     assert job["settings"]["whisper_model"] == "turbo"
     assert job["logs"][0]["message"] == "Whisper started"
+    assert log_entry == job["logs"][0]
     assert store.find_active_by_source("local", "/tmp/input.mp4")["id"] == "abc"
 
 
@@ -67,3 +71,39 @@ def test_job_store_makes_interrupted_jobs_retryable_without_losing_history(tmp_p
         assert job["logs"][-1]["level"] == "WARNING"
     assert store.get_job("done-job")["status"] == "completed"
     assert store.mark_interrupted_jobs() == []
+
+
+def test_job_store_can_update_retry_settings(tmp_path):
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    store.create_job(
+        job_id="retry-model",
+        source_kind="youtube",
+        source_value="https://youtu.be/test",
+        reference_path=None,
+        settings={"translation_provider": "ollama", "translation_model": "missing"},
+        work_dir=str(tmp_path / "retry-model"),
+    )
+
+    updated = store.update_settings(
+        "retry-model",
+        {"translation_provider": "ollama", "translation_model": "installed:latest"},
+    )
+
+    assert updated["settings"]["translation_model"] == "installed:latest"
+
+
+def test_awaiting_reference_job_still_blocks_duplicate_source(tmp_path):
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    store.create_job(
+        job_id="waiting",
+        source_kind="youtube",
+        source_value="https://youtu.be/reference",
+        reference_path=None,
+        settings={},
+        work_dir=str(tmp_path / "waiting"),
+    )
+    store.update_job("waiting", status="awaiting_reference")
+
+    duplicate = store.find_active_by_source("youtube", "https://youtu.be/reference")
+    assert duplicate is not None
+    assert duplicate["id"] == "waiting"

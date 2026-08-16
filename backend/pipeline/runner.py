@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import logging
+import hashlib
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -8,9 +8,11 @@ from backend.config import Settings
 from backend.models.domain import JobSettings, Transcript
 from backend.pipeline.alignment import build_atempo_filter, plan_duration_match
 from backend.pipeline.audio import (
+    build_media_cache_metadata,
     commit_media_output,
     cut_reference_audio,
     extract_audio_tracks,
+    file_content_fingerprint,
     media_cache_is_valid,
     media_duration,
     select_reference_segment,
@@ -19,7 +21,14 @@ from backend.pipeline.context import JobPaths
 from backend.pipeline.download import download_video
 from backend.pipeline.mixer import build_dubbed_timeline, build_separator, mix_audio
 from backend.pipeline.muxer import mux_burned_subtitle, mux_soft_subtitle
-from backend.pipeline.segmenter import merge_short_segments
+from backend.pipeline.segmenter import (
+    default_segmenter_parameters,
+    implausible_segment_ids,
+    load_segmented_transcript_cache,
+    save_segmented_transcript_cache,
+    semantic_sentence_segments,
+    tail_credit_segment_ids,
+)
 from backend.pipeline.subtitle import write_ass, write_srt
 from backend.pipeline.translator import (
     Translator,
@@ -27,13 +36,12 @@ from backend.pipeline.translator import (
     save_translation_cache,
     translate_transcript,
 )
-from backend.pipeline.tts import CosyVoiceClient, wav_duration
+from backend.pipeline.tts import CosyVoiceClient, TTSServiceError, wav_duration
 from backend.pipeline.whisper_asr import WhisperAdapter
 from backend.utils.files import atomic_copy, atomic_write_json, read_json, temporary_output_path
 from backend.utils.process import require_executable, run_process
 
 
-logger = logging.getLogger(__name__)
 UpdateCallback = Callable[..., Awaitable[dict[str, Any]]]
 LogCallback = Callable[[str, str], Awaitable[None]]
 CancelledCallback = Callable[[], bool]
@@ -52,8 +60,57 @@ STEPS = (
 )
 
 
+async def _copy_soft_subtitle_alias(
+    source: Path,
+    destination: Path,
+    config: Settings,
+) -> Path:
+    """Cache the user-facing soft-subtitle alias by its source bytes."""
+
+    cache_metadata = build_media_cache_metadata(
+        "soft-subtitle-alias",
+        inputs={"final_zh": file_content_fingerprint(source)},
+        parameters={"operation": "byte-for-byte-copy"},
+    )
+    required_streams = {"video", "audio", "subtitle"}
+    if await media_cache_is_valid(
+        destination,
+        config,
+        required_stream_types=required_streams,
+        expected_metadata=cache_metadata,
+    ):
+        return destination
+    pending = temporary_output_path(destination)
+    try:
+        atomic_copy(source, pending)
+        await commit_media_output(
+            pending,
+            destination,
+            config,
+            required_stream_types=required_streams,
+            cache_metadata=cache_metadata,
+        )
+    finally:
+        pending.unlink(missing_ok=True)
+    return destination
+
+
 class PipelineCancelled(RuntimeError):
     pass
+
+
+class PipelineAwaitingReference(RuntimeError):
+    def __init__(self, segment_count: int):
+        super().__init__("请选择一个参考声音片段后继续")
+        self.segment_count = segment_count
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 class PipelineRunner:
@@ -127,17 +184,66 @@ class PipelineRunner:
 
         await step(4)
         segmented_path = paths.asr / "segmented_transcript.json"
-        segmented = self._load_transcript(segmented_path)
+        segmenter_parameters = default_segmenter_parameters()
+        rejected_segment_ids = implausible_segment_ids(transcript.segments)
+        rejected_credit_ids = tail_credit_segment_ids(transcript)
+        segmented = load_segmented_transcript_cache(
+            segmented_path,
+            transcript,
+            parameters=segmenter_parameters,
+        )
         if segmented is None:
-            segmented = merge_short_segments(transcript)
-            segmented.duration = duration
-            atomic_write_json(segmented_path, segmented.model_dump())
+            segmented = semantic_sentence_segments(transcript, **segmenter_parameters)
+            save_segmented_transcript_cache(
+                segmented_path,
+                transcript,
+                segmented,
+                parameters=segmenter_parameters,
+            )
+        if rejected_segment_ids:
+            await log(
+                "[SEGMENT] 已过滤 Whisper 低置信度异常语速片段："
+                + ", ".join(str(segment_id) for segment_id in rejected_segment_ids),
+                "WARNING",
+            )
+        if rejected_credit_ids:
+            credit_id_set = set(rejected_credit_ids)
+            credit_segments = [
+                segment
+                for segment in transcript.segments
+                if segment.id in credit_id_set
+            ]
+            await log(
+                "[SEGMENT] 已过滤片尾鸣谢名单：IDs "
+                + ", ".join(str(segment_id) for segment_id in rejected_credit_ids)
+                + (
+                    f"；时间 {min(segment.start for segment in credit_segments):.2f}"
+                    f"-{max(segment.end for segment in credit_segments):.2f} 秒"
+                ),
+                "INFO",
+            )
+        if not segmented.segments:
+            raise RuntimeError("Whisper 片段均被判定为异常，无法继续翻译")
+        # Container duration is runtime media state, not part of segmentation.
+        # Always refresh it even when the semantic grouping itself was cached.
+        segmented.duration = duration
         await update(segments_total=len(segmented.segments), segments_done=0)
         await log(
             f"字幕片段：Whisper {len(transcript.segments)} 段 → 语义整理 {len(segmented.segments)} 段",
             "INFO",
         )
         await finish_step(4)
+
+        # Manual reference selection depends on the normalized ASR segments.
+        # Pause here, before translation and TTS spend any additional time.  A
+        # later run reuses download/audio/ASR/segmentation caches after the API
+        # persists the selected segment ID.
+        if (
+            options.dubbing_enabled
+            and options.reference_mode == "segment"
+            and options.reference_segment_id is None
+        ):
+            raise PipelineAwaitingReference(len(segmented.segments))
 
         await step(5)
         translator = build_translator(
@@ -267,12 +373,7 @@ class PipelineRunner:
         artifacts: list[Path] = [final_video]
         if soft_subtitle is not None:
             soft_alias = paths.output / "final_zh_subtitle.mp4"
-            if not await media_cache_is_valid(
-                soft_alias,
-                self.config,
-                required_stream_types={"video", "audio", "subtitle"},
-            ):
-                atomic_copy(final_video, soft_alias)
+            await _copy_soft_subtitle_alias(final_video, soft_alias, self.config)
             artifacts.append(soft_alias)
         if options.subtitle_mode in {"burn", "both"}:
             burned = await mux_burned_subtitle(
@@ -310,16 +411,6 @@ class PipelineRunner:
             "duration": duration,
             "segments": len(translated.segments),
         }
-
-    @staticmethod
-    def _load_transcript(path: Path) -> Transcript | None:
-        if not path.exists():
-            return None
-        try:
-            return Transcript.model_validate(read_json(path))
-        except Exception as exc:
-            logger.warning("忽略损坏的分段缓存 %s: %s", path, exc)
-            return None
 
     @staticmethod
     def _write_chinese_subtitles(
@@ -406,16 +497,21 @@ class PipelineRunner:
                     if compressed == segment.translated_text:
                         break
                     segment.translated_text = compressed
+                    # Compression changes the canonical speech content, so update
+                    # the speed=1 source cache.  Never write a speed-adjusted
+                    # derivative over this path; synthesize_segments relies on it
+                    # as the stable source on every resume.
+                    base_tts = paths.tts / f"{segment.id:04d}.wav"
                     synthesis = await client.synthesize(
                         text=compressed,
                         prompt_audio=reference_audio,
                         prompt_text=reference_text,
-                        output_path=Path(segment.tts_file),
+                        output_path=base_tts,
                         speed=1.0,
-                        overwrite=True,
                     )
+                    segment.tts_file = str(synthesis.path)
                     segment.tts_duration = synthesis.duration
-                    changed = True
+                    changed = not synthesis.cached or changed
                     plan = plan_duration_match(synthesis.duration, segment.duration)
                     await log(
                         f"[ALIGN] segment={segment.id} 压缩译文第 {compression_round} 次，"
@@ -428,25 +524,49 @@ class PipelineRunner:
             # Use CosyVoice speed first for a mild excess, then only a tiny atempo correction.
             plan = plan_duration_match(segment.tts_duration or 0, segment.duration)
             if plan.action == "speed_up" and plan.tts_speed > 1.001:
+                original_tts_file = segment.tts_file
+                original_tts_duration = float(segment.tts_duration or 0)
+                speed_adjusted = paths.tts / f"{segment.id:04d}_speed.wav"
                 synthesis = await client.synthesize(
                     text=segment.translated_text or "",
                     prompt_audio=reference_audio,
                     prompt_text=reference_text,
-                    output_path=Path(segment.tts_file),
+                    output_path=speed_adjusted,
                     speed=plan.tts_speed,
-                    overwrite=True,
                 )
-                segment.tts_duration = synthesis.duration
-                changed = True
+                # CosyVoice's speed control is model-dependent and can occasionally
+                # make a short utterance longer.  A derivative is useful only when
+                # its measured duration improves on the current candidate by enough
+                # to exceed normal WAV rounding/jitter (at least 20 ms and 1%).
+                minimum_improvement = max(0.02, original_tts_duration * 0.01)
+                if synthesis.duration <= original_tts_duration - minimum_improvement:
+                    segment.tts_file = str(synthesis.path)
+                    segment.tts_duration = synthesis.duration
+                    changed = not synthesis.cached or changed
+                else:
+                    await log(
+                        f"[ALIGN] segment={segment.id} 拒绝 CosyVoice speed="
+                        f"{plan.tts_speed:.3f} 候选：original={original_tts_duration:.2f}s "
+                        f"generated={synthesis.duration:.2f}s cached={synthesis.cached}；"
+                        "未明显缩短，保留原音频并仅使用温和 atempo",
+                        "WARNING",
+                    )
+                    # Generating an unused derivative must not invalidate the
+                    # timeline/mix/mux caches.  Keep the exact original candidate;
+                    # the following atempo pass fingerprints that accepted input.
+                    segment.tts_file = original_tts_file
+                    segment.tts_duration = original_tts_duration
 
             ratio = (segment.tts_duration or 0) / segment.duration
             atempo = min(max(ratio, 1.0), 1.06)
             if atempo > 1.001:
                 aligned = paths.tts / f"{segment.id:04d}_aligned.wav"
-                await self._apply_atempo(Path(segment.tts_file), aligned, atempo)
+                atempo_changed = await self._apply_atempo(
+                    Path(segment.tts_file), aligned, atempo
+                )
                 segment.tts_file = str(aligned)
                 segment.tts_duration = wav_duration(aligned)
-                changed = True
+                changed = atempo_changed or changed
             final_ratio = (segment.tts_duration or 0) / segment.duration
             level = "WARNING" if final_ratio > 1.15 else "INFO"
             await log(
@@ -472,7 +592,33 @@ class PipelineRunner:
         ):
             path.unlink(missing_ok=True)
 
-    async def _apply_atempo(self, source: Path, output: Path, factor: float) -> None:
+    async def _apply_atempo(self, source: Path, output: Path, factor: float) -> bool:
+        """Create an atempo derivative, returning whether the cached output changed."""
+
+        source = source.expanduser().resolve()
+        output = output.expanduser().resolve()
+        if not source.is_file():
+            raise RuntimeError(f"atempo 输入不存在：{source}")
+        normalized_factor = round(float(factor), 6)
+        expected_metadata = {
+            "version": 1,
+            "kind": "ffmpeg_atempo",
+            "source": str(source),
+            "source_size": source.stat().st_size,
+            "source_sha256": _sha256_file(source),
+            "factor": normalized_factor,
+            "filter": build_atempo_filter(normalized_factor),
+        }
+        metadata_path = output.with_name(f"{output.name}.meta.json")
+        try:
+            cached_metadata = read_json(metadata_path)
+            cached_duration = wav_duration(output)
+        except (OSError, ValueError, TypeError, TTSServiceError):
+            cached_metadata = None
+            cached_duration = 0.0
+        if cached_duration > 0 and cached_metadata == expected_metadata:
+            return False
+
         binary = require_executable(self.config.ffmpeg_bin, "ffmpeg")
         temporary = temporary_output_path(output)
         try:
@@ -483,7 +629,7 @@ class PipelineRunner:
                     "-i",
                     str(source),
                     "-af",
-                    build_atempo_filter(factor),
+                    expected_metadata["filter"],
                     "-c:a",
                     "pcm_s16le",
                     str(temporary),
@@ -495,5 +641,7 @@ class PipelineRunner:
                 self.config,
                 required_stream_types={"audio"},
             )
+            atomic_write_json(metadata_path, expected_metadata)
         finally:
             temporary.unlink(missing_ok=True)
+        return True

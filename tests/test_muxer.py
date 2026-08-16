@@ -31,6 +31,9 @@ async def test_soft_subtitle_mux_does_not_stop_at_subtitle_end(
     monkeypatch.setattr(muxer, "run_process", fake_run_process)
     monkeypatch.setattr(muxer, "commit_media_output", fake_commit)
     output = tmp_path / "output" / "final_zh.mp4"
+    (tmp_path / "source.mp4").write_bytes(b"video")
+    (tmp_path / "mixed.wav").write_bytes(b"audio")
+    (tmp_path / "zh.srt").write_text("subtitle", encoding="utf-8")
 
     result = await muxer.mux_soft_subtitle(
         tmp_path / "source.mp4",

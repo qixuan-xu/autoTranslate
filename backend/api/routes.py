@@ -12,11 +12,11 @@ from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 
 from backend.config import settings
-from backend.models.domain import JobSettings
+from backend.models.domain import JobSettings, ReferenceSelection, Transcript
 from backend.pipeline.context import JobPaths
 from backend.services.job_manager import JobManager
-from backend.services.job_store import JobStore, TERMINAL_STATUSES
-from backend.utils.files import is_relative_to, temporary_output_path
+from backend.services.job_store import JobStore, STREAM_END_STATUSES
+from backend.utils.files import is_relative_to, read_json, temporary_output_path
 from backend.utils.process import require_executable
 
 
@@ -27,6 +27,26 @@ def _services(request: Request) -> tuple[JobStore, JobManager]:
     return request.app.state.job_store, request.app.state.job_manager
 
 
+def _segmented_transcript(job: dict) -> Transcript:
+    path = Path(job["work_dir"]) / "asr" / "segmented_transcript.json"
+    if not path.is_file():
+        raise HTTPException(
+            status_code=409,
+            detail="参考片段尚未就绪，请先等待 ASR 和字幕整理完成",
+        )
+    try:
+        payload = read_json(path)
+        # Current segmented caches wrap the transcript with input/version
+        # fingerprints; accept the earlier raw-transcript layout as well.
+        transcript_payload = payload.get("transcript", payload)
+        return Transcript.model_validate(transcript_payload)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="已整理的字幕缓存损坏，请重试任务",
+        ) from exc
+
+
 def _bool(value: str, default: bool) -> bool:
     normalized = (value or "").strip().lower()
     if normalized in {"1", "true", "yes", "on"}:
@@ -34,6 +54,37 @@ def _bool(value: str, default: bool) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     return default
+
+
+async def _ollama_info() -> dict:
+    url = f"{settings.ollama_base_url.rstrip('/')}/api/tags"
+    try:
+        async with httpx.AsyncClient(timeout=3.0, trust_env=False) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            payload = response.json()
+    except Exception as exc:
+        return {
+            "ok": False,
+            "url": settings.ollama_base_url,
+            "configured_model": settings.ollama_model,
+            "models": [],
+            "error": f"Ollama 未响应：{exc}",
+        }
+    models = sorted(
+        {
+            str(item.get("name") or item.get("model") or "").strip()
+            for item in payload.get("models", [])
+            if isinstance(item, dict) and (item.get("name") or item.get("model"))
+        }
+    )
+    return {
+        "ok": True,
+        "url": settings.ollama_base_url,
+        "configured_model": settings.ollama_model,
+        "configured_available": settings.ollama_model in models,
+        "models": models,
+    }
 
 
 async def _save_upload(upload: UploadFile, destination: Path, maximum_bytes: int) -> Path:
@@ -79,10 +130,12 @@ async def health() -> dict:
             cosyvoice = {**response.json(), "ok": response.is_success, "url": settings.cosyvoice_url}
     except Exception:
         cosyvoice["error"] = "服务未启动；仅字幕任务仍可运行"
+    ollama = await _ollama_info()
     return {
         "ok": all(item["ok"] for key, item in tools.items() if key != "yt-dlp"),
         "tools": tools,
         "cosyvoice": cosyvoice,
+        "ollama": ollama,
         "work_dir": str(settings.work_dir),
     }
 
@@ -138,6 +191,24 @@ async def create_job(
         )
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"设置无效：{exc}") from exc
+
+    if job_settings.translation_provider == "ollama":
+        requested_model = job_settings.translation_model or settings.ollama_model
+        ollama = await _ollama_info()
+        if not ollama["ok"]:
+            raise HTTPException(
+                status_code=503,
+                detail="Ollama 未启动。请先运行 ollama serve，再创建任务。",
+            )
+        if requested_model not in ollama["models"]:
+            installed = "、".join(ollama["models"]) or "无"
+            raise HTTPException(
+                status_code=422,
+                detail=f"Ollama 模型 {requested_model} 未安装；当前可用：{installed}",
+            )
+        job_settings.translation_model = requested_model
+    elif not (job_settings.translation_model or settings.openai_model):
+        raise HTTPException(status_code=422, detail="OpenAI-compatible 模式必须填写翻译模型")
 
     job_id = uuid.uuid4().hex[:16]
     paths = JobPaths.create(settings.work_dir, job_id)
@@ -202,15 +273,135 @@ async def cancel_job(job_id: str, request: Request) -> dict:
 
 
 @router.post("/jobs/{job_id}/retry")
-async def retry_job(job_id: str, request: Request) -> dict:
+async def retry_job(
+    job_id: str,
+    request: Request,
+    translation_provider: str = Form(""),
+    translation_model: str = Form(""),
+) -> dict:
     store, manager = _services(request)
     try:
+        job = store.get_job(job_id)
+        if job["status"] == "awaiting_reference":
+            raise HTTPException(
+                status_code=409,
+                detail="任务正在等待参考片段，请使用 /reference 接口继续",
+            )
+        if translation_provider.strip() or translation_model.strip():
+            retry_values = dict(job["settings"])
+            if translation_provider.strip():
+                retry_values["translation_provider"] = translation_provider.strip().lower()
+            if translation_model.strip():
+                retry_values["translation_model"] = translation_model.strip()
+            try:
+                retry_settings = JobSettings.model_validate(retry_values)
+            except Exception as exc:
+                raise HTTPException(status_code=422, detail=f"设置无效：{exc}") from exc
+            if retry_settings.translation_provider == "ollama":
+                requested_model = retry_settings.translation_model or settings.ollama_model
+                ollama = await _ollama_info()
+                if not ollama["ok"]:
+                    raise HTTPException(status_code=503, detail="Ollama 未启动，不能重试任务")
+                if requested_model not in ollama["models"]:
+                    installed = "、".join(ollama["models"]) or "无"
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"Ollama 模型 {requested_model} 未安装；当前可用：{installed}",
+                    )
+                retry_settings.translation_model = requested_model
+            elif not (retry_settings.translation_model or settings.openai_model):
+                raise HTTPException(
+                    status_code=422,
+                    detail="OpenAI-compatible 模式必须填写翻译模型",
+                )
+            store.update_settings(job_id, retry_settings.model_dump())
         manager.retry(job_id)
         return store.get_job(job_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="任务不存在") from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.get("/jobs/{job_id}/segments")
+async def get_reference_segments(job_id: str, request: Request) -> dict:
+    store, _ = _services(request)
+    try:
+        job = store.get_job(job_id, include_logs=False)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="任务不存在") from exc
+    transcript = _segmented_transcript(job)
+    return {
+        "job_id": job_id,
+        "status": job["status"],
+        "language": transcript.language,
+        "segments": [
+            {
+                "id": segment.id,
+                "start": segment.start,
+                "end": segment.end,
+                "duration": segment.duration,
+                "text": segment.text,
+                "confidence": segment.confidence,
+            }
+            for segment in transcript.segments
+        ],
+    }
+
+
+@router.post("/jobs/{job_id}/reference")
+async def select_reference_segment(
+    job_id: str,
+    request: Request,
+) -> dict:
+    store, manager = _services(request)
+    try:
+        content_type = request.headers.get("content-type", "").casefold()
+        if "application/json" in content_type:
+            raw_selection = await request.json()
+        else:
+            form = await request.form()
+            raw_selection = {"segment_id": form.get("segment_id")}
+        selection = ReferenceSelection.model_validate(raw_selection)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"参考片段设置无效：{exc}") from exc
+    try:
+        job = store.get_job(job_id, include_logs=False)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="任务不存在") from exc
+    if job["status"] != "awaiting_reference":
+        raise HTTPException(status_code=409, detail="任务当前不在等待参考片段")
+
+    options = JobSettings.model_validate(job["settings"])
+    if not options.dubbing_enabled or options.reference_mode != "segment":
+        raise HTTPException(status_code=409, detail="任务未启用手动参考片段模式")
+    transcript = _segmented_transcript(job)
+    segment = next(
+        (item for item in transcript.segments if item.id == selection.segment_id),
+        None,
+    )
+    if segment is None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"找不到参考 segment ID：{selection.segment_id}",
+        )
+
+    updated_options = options.model_copy(
+        update={"reference_segment_id": selection.segment_id}
+    )
+    try:
+        store.select_reference(job_id, updated_options.model_dump())
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    store.add_log(
+        job_id,
+        f"已选择参考 segment {segment.id}（{segment.start:.2f}s–{segment.end:.2f}s）",
+    )
+    try:
+        await manager.resume_reference(job_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return store.get_job(job_id)
 
 
 @router.get("/jobs/{job_id}/events")
@@ -225,15 +416,30 @@ async def job_events(job_id: str, request: Request) -> StreamingResponse:
         try:
             initial = store.get_job(job_id)
             yield f"event: update\ndata: {json.dumps(initial, ensure_ascii=False)}\n\n"
-            if initial["status"] in TERMINAL_STATUSES:
+            if initial["status"] in STREAM_END_STATUSES:
                 return
             while True:
                 if await request.is_disconnected():
                     return
                 try:
-                    job = await asyncio.wait_for(queue.get(), timeout=15)
-                    yield f"event: update\ndata: {json.dumps(job, ensure_ascii=False)}\n\n"
-                    if job["status"] in TERMINAL_STATUSES:
+                    event = await asyncio.wait_for(queue.get(), timeout=15)
+                    if "type" in event and "data" in event:
+                        event_type = str(event["type"])
+                        payload = event["data"]
+                    else:
+                        # Compatibility for an in-process publisher using the
+                        # pre-incremental queue payload.
+                        event_type = "update"
+                        payload = event
+                    yield (
+                        f"event: {event_type}\n"
+                        f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                    )
+                    if (
+                        event_type == "update"
+                        and isinstance(payload, dict)
+                        and payload.get("status") in STREAM_END_STATUSES
+                    ):
                         return
                 except asyncio.TimeoutError:
                     yield ": keep-alive\n\n"
