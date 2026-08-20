@@ -1,6 +1,11 @@
 .DS_Store
 .env
+.env.*
+!.env.example
+cookies*.txt
 .venv/
+.venv.backup-*/
+.venv.failed-*/
 __pycache__/
 *.py[cod]
 .pytest_cache/

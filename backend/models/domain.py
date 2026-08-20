@@ -62,3 +62,7 @@ class JobSettings(BaseModel):
 
     def public_dict(self) -> Dict[str, Any]:
         return self.model_dump()
+
+
+class ReferenceSelection(BaseModel):
+    segment_id: int = Field(ge=0)

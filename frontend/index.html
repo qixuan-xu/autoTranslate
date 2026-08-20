@@ -141,7 +141,8 @@
               </div>
               <label class="control-label full-control">
                 <span>翻译模型</span>
-                <input name="translation_model" id="translation-model" value="qwen2.5:14b" autocomplete="off" />
+                <input name="translation_model" id="translation-model" value="qwen2.5:14b" list="ollama-model-list" autocomplete="off" />
+                <datalist id="ollama-model-list"></datalist>
               </label>
             </fieldset>
 
@@ -165,7 +166,7 @@
                   </label>
                   <label>
                     <input type="radio" name="voice_mode" value="segment" />
-                    <span><strong>指定片段</strong><small>使用转写 segment ID</small></span>
+                    <span><strong>指定片段</strong><small>转写后从原文列表选择</small></span>
                   </label>
                   <label>
                     <input type="radio" name="voice_mode" value="upload" />
@@ -174,11 +175,8 @@
                 </div>
 
                 <div id="segment-reference" class="conditional-control" hidden>
-                  <label class="control-label">
-                    <span>Segment ID</span>
-                    <input name="reference_segment_id" id="reference-segment-id" type="number" min="0" step="1" placeholder="例如 12" />
-                  </label>
-                  <p>将在转写完成后使用对应原文与音频片段。</p>
+                  <strong class="conditional-title">转写后选择参考片段</strong>
+                  <p>任务会在 Whisper 转写和字幕整理完成后暂停，并在右侧列出带时间轴的原文片段供你选择。</p>
                 </div>
 
                 <div id="upload-reference" class="conditional-control upload-reference" hidden>
@@ -298,6 +296,36 @@
               <div><span>配音片段</span><strong id="segment-count">—</strong></div>
               <div><span>运行时间</span><strong id="elapsed-time">00:00</strong></div>
             </div>
+
+            <section
+              id="reference-picker"
+              class="reference-picker"
+              aria-labelledby="reference-picker-title"
+              hidden
+            >
+              <div class="reference-picker-heading">
+                <div>
+                  <span class="reference-picker-kicker">VOICE REFERENCE</span>
+                  <h3 id="reference-picker-title">选择一段参考声音</h3>
+                </div>
+                <span class="reference-required-chip">需要你的选择</span>
+              </div>
+              <p class="reference-picker-help">
+                请选择一段人声清晰、语义完整、背景声较少的原文。选中后任务会自动继续。
+              </p>
+              <div id="reference-picker-state" class="reference-picker-state" role="status">
+                正在读取转写片段…
+              </div>
+              <div
+                id="reference-segment-list"
+                class="reference-segment-list"
+                role="list"
+                aria-label="可选参考声音片段"
+              ></div>
+              <button id="reference-picker-refresh" class="quiet-button reference-picker-refresh" type="button" hidden>
+                重新加载片段
+              </button>
+            </section>
 
             <ol id="pipeline-steps" class="pipeline-steps">
               <li data-step="1"><span class="step-marker">1</span><div><strong>下载 / 导入视频</strong><small>准备源媒体</small></div><span class="step-state">等待</span></li>

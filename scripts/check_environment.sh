@@ -100,14 +100,10 @@ resolve_executable() {
 printf 'AutoTranslate 环境检查\n'
 printf '项目目录：%s\n\n' "${PROJECT_ROOT}"
 
-if [ -x "${PROJECT_ROOT}/.venv/bin/python" ]; then
-  PATH="${PROJECT_ROOT}/.venv/bin:${PATH}"
-  export PATH
-fi
-
+venv_dir="$(expand_path "${VENV_DIR:-.venv}")"
 python_candidate="${PYTHON_BIN:-}"
-if [ -z "${python_candidate}" ] && [ -x "${PROJECT_ROOT}/.venv/bin/python" ]; then
-  python_candidate="${PROJECT_ROOT}/.venv/bin/python"
+if [ -z "${python_candidate}" ] && [ -x "${venv_dir}/bin/python" ]; then
+  python_candidate="${venv_dir}/bin/python"
 elif [ -z "${python_candidate}" ]; then
   python_candidate="python3"
 fi
@@ -115,13 +111,28 @@ fi
 printf '核心工具\n'
 if python_path="$(resolve_executable "${python_candidate}")"; then
   python_version="$("${python_path}" --version 2>&1)"
-  if "${python_path}" -c 'import sys; raise SystemExit(sys.version_info < (3, 9))' >/dev/null 2>&1; then
-    pass "Python：${python_path}（${python_version}）"
+  if "${python_path}" -c 'import sys; raise SystemExit(sys.version_info < (3, 10))' >/dev/null 2>&1; then
+    pass "应用 Python：${python_path}（${python_version}）"
   else
-    fail "需要 Python 3.9 或更高版本；当前为 ${python_version}"
+    fail "应用 Python 最低需要 3.10；当前为 ${python_path}（${python_version}）"
+    for fallback_python in python python3 python3.14 python3.13 python3.12 python3.11 python3.10; do
+      fallback_path="$(resolve_executable "${fallback_python}" || true)"
+      [ -n "${fallback_path}" ] || continue
+      if "${fallback_path}" -c 'import sys; raise SystemExit(sys.version_info < (3, 10))' \
+        >/dev/null 2>&1; then
+        fallback_version="$("${fallback_path}" --version 2>&1)"
+        warn "可用 ${fallback_path}（${fallback_version}）重建环境：./scripts/setup.sh"
+        break
+      fi
+    done
   fi
 else
-  fail "找不到 Python。请安装 Python 3，并运行 scripts/setup.sh"
+  fail "找不到 Python。请安装 Python 3.10+，并运行 scripts/setup.sh"
+fi
+
+if [ -x "${venv_dir}/bin/python" ]; then
+  PATH="${venv_dir}/bin:${PATH}"
+  export PATH
 fi
 
 ffmpeg_bin="$(dotenv_value FFMPEG_BIN ffmpeg)"
@@ -146,12 +157,91 @@ else
 fi
 
 printf '\n可选输入与高级功能\n'
+youtube_runtime_ok=1
 ytdlp_bin="$(dotenv_value YTDLP_BIN yt-dlp)"
 if ytdlp_path="$(resolve_executable "${ytdlp_bin}")"; then
   ytdlp_version="$("${ytdlp_path}" --version 2>/dev/null || true)"
-  pass "yt-dlp：${ytdlp_path}${ytdlp_version:+（${ytdlp_version}）}"
+  if [ -n "${ytdlp_version}" ]; then
+    pass "yt-dlp 命令：${ytdlp_path}（${ytdlp_version}）"
+  else
+    warn "yt-dlp 命令存在但无法读取版本：${ytdlp_path}"
+    youtube_runtime_ok=0
+  fi
 else
   warn "找不到 yt-dlp；本地视频仍可用，但 YouTube 下载不可用"
+  youtube_runtime_ok=0
+fi
+
+if [ -x "${venv_dir}/bin/python" ]; then
+  if ytdlp_module_version="$("${venv_dir}/bin/python" -c \
+    'import importlib.metadata, yt_dlp; print(importlib.metadata.version("yt-dlp"))' \
+    2>/dev/null)"; then
+    pass "yt_dlp Python 模块：${ytdlp_module_version}"
+  else
+    warn "项目虚拟环境无法 import yt_dlp；请重新运行 ./scripts/setup.sh"
+    youtube_runtime_ok=0
+  fi
+  if ytdlp_ejs_version="$("${venv_dir}/bin/python" -c \
+    'import importlib.metadata, yt_dlp_ejs; print(importlib.metadata.version("yt-dlp-ejs"))' \
+    2>/dev/null)"; then
+    pass "yt_dlp_ejs Python 模块：${ytdlp_ejs_version}"
+  else
+    warn "项目虚拟环境无法 import yt_dlp_ejs；请重新运行 ./scripts/setup.sh"
+    youtube_runtime_ok=0
+  fi
+else
+  warn "缺少项目虚拟环境，无法验证 yt_dlp/yt_dlp_ejs Python 模块"
+  youtube_runtime_ok=0
+fi
+
+ytdlp_js_runtime="$(dotenv_value YTDLP_JS_RUNTIME node)"
+node_candidate=""
+case "${ytdlp_js_runtime}" in
+  node)
+    node_candidate="node"
+    ;;
+  node:/*)
+    node_candidate="${ytdlp_js_runtime#node:}"
+    ;;
+  node:*)
+    warn "YTDLP_JS_RUNTIME 中的 Node 路径必须是绝对路径：${ytdlp_js_runtime}"
+    youtube_runtime_ok=0
+    ;;
+  *)
+    warn "无法预检 YTDLP_JS_RUNTIME=${ytdlp_js_runtime}；当前脚本支持 node 或 node:/绝对路径"
+    youtube_runtime_ok=0
+    ;;
+esac
+
+if [ -n "${node_candidate}" ]; then
+  if node_path="$(resolve_executable "${node_candidate}")"; then
+    node_version="$("${node_path}" --version 2>/dev/null || true)"
+    node_major="${node_version#v}"
+    node_major="${node_major%%.*}"
+    case "${node_major}" in
+      ''|*[!0-9]*)
+        warn "无法解析 Node 版本：${node_path}${node_version:+（${node_version}）}"
+        youtube_runtime_ok=0
+        ;;
+      *)
+        if [ "${node_major}" -ge 22 ]; then
+          pass "YouTube JS runtime：${node_path}（${node_version}）"
+        else
+          warn "YouTube JS runtime 需要 Node 22+；当前为 ${node_path}（${node_version}）"
+          youtube_runtime_ok=0
+        fi
+        ;;
+    esac
+  else
+    warn "找不到 YouTube JS runtime：${node_candidate}；请安装 Node 22+ 或修改 YTDLP_JS_RUNTIME"
+    youtube_runtime_ok=0
+  fi
+fi
+
+if [ "${youtube_runtime_ok}" -eq 1 ]; then
+  pass "YouTube 下载运行时完整（yt-dlp + EJS + Node 22+）"
+else
+  warn "YouTube 下载运行时不完整；本地视频处理仍可用"
 fi
 
 if demucs_path="$(resolve_executable demucs)"; then

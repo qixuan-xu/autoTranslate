@@ -28,27 +28,114 @@ resolve_executable() {
   esac
 }
 
-python_candidate="${PYTHON_BIN:-python3}"
-if ! python_path="$(resolve_executable "${python_candidate}")"; then
-  printf '错误：找不到 %s。请先安装 Python 3.9 或更高版本。\n' "${python_candidate}" >&2
+python_is_supported() {
+  "$1" -c 'import sys; raise SystemExit(sys.version_info < (3, 10))' \
+    >/dev/null 2>&1
+}
+
+python_version() {
+  "$1" -c 'import platform; print(platform.python_version())' 2>/dev/null
+}
+
+select_python() {
+  local candidate=""
+  local resolved=""
+  local seen_paths=":"
+
+  if [ -n "${PYTHON_BIN:-}" ]; then
+    if ! resolved="$(resolve_executable "${PYTHON_BIN}")"; then
+      printf '错误：PYTHON_BIN 指向的可执行文件不存在：%s\n' "${PYTHON_BIN}" >&2
+      return 1
+    fi
+    if ! python_is_supported "${resolved}"; then
+      printf '错误：PYTHON_BIN=%s 是 Python %s，项目需要 Python 3.10 或更高版本。\n' \
+        "${resolved}" "$(python_version "${resolved}" || printf '未知')" >&2
+      return 1
+    fi
+    printf '%s\n' "${resolved}"
+    return 0
+  fi
+
+  # macOS 自带的 /usr/bin/python3 可能仍是 3.9，而 Homebrew/Conda 的新版
+  # Python 常以 `python` 或带版本的名称安装。逐个校验，不仅依赖命令名。
+  for candidate in python python3 python3.14 python3.13 python3.12 python3.11 python3.10; do
+    resolved="$(resolve_executable "${candidate}" || true)"
+    [ -n "${resolved}" ] || continue
+    case "${seen_paths}" in
+      *":${resolved}:"*) continue ;;
+    esac
+    seen_paths="${seen_paths}${resolved}:"
+    if python_is_supported "${resolved}"; then
+      printf '%s\n' "${resolved}"
+      return 0
+    fi
+  done
+
+  printf '错误：找不到 Python 3.10 或更高版本。macOS 可运行 `brew install python`，\n' >&2
+  printf '或用 PYTHON_BIN=/绝对路径/python ./scripts/setup.sh 指定已安装的 Python。\n' >&2
+  return 1
+}
+
+if ! python_path="$(select_python)"; then
   exit 1
 fi
-if ! "${python_path}" -c 'import sys; raise SystemExit(sys.version_info < (3, 9))'; then
-  printf '错误：需要 Python 3.9 或更高版本。\n' >&2
-  exit 1
-fi
+printf '使用 Python：%s（%s）\n' "${python_path}" "$(python_version "${python_path}")"
 
 venv_dir="$(expand_path "${VENV_DIR:-.venv}")"
+case "${venv_dir}" in
+  "/"|"${HOME}"|"${PROJECT_ROOT}")
+    printf '错误：VENV_DIR 不能是根目录、用户主目录或项目根目录：%s\n' "${venv_dir}" >&2
+    exit 1
+    ;;
+esac
+
+venv_backup=""
+venv_rebuild_reason=""
+if [ -e "${venv_dir}" ] || [ -L "${venv_dir}" ]; then
+  if [ ! -x "${venv_dir}/bin/python" ]; then
+    venv_rebuild_reason="现有路径不是可用的 Python 虚拟环境"
+  elif ! python_is_supported "${venv_dir}/bin/python"; then
+    venv_rebuild_reason="现有虚拟环境使用 Python $(python_version "${venv_dir}/bin/python" || printf '未知')，低于要求的 3.10"
+  fi
+fi
+
+if [ -n "${venv_rebuild_reason}" ]; then
+  backup_base="${venv_dir}.backup-$(date '+%Y%m%d-%H%M%S')"
+  venv_backup="${backup_base}"
+  backup_index=1
+  while [ -e "${venv_backup}" ] || [ -L "${venv_backup}" ]; do
+    venv_backup="${backup_base}-${backup_index}"
+    backup_index=$((backup_index + 1))
+  done
+  printf '需要重建虚拟环境：%s。\n' "${venv_rebuild_reason}"
+  printf '为保留旧环境，将其移动到：%s\n' "${venv_backup}"
+  mv "${venv_dir}" "${venv_backup}"
+fi
+
 if [ ! -x "${venv_dir}/bin/python" ]; then
   printf '创建虚拟环境：%s\n' "${venv_dir}"
-  "${python_path}" -m venv "${venv_dir}"
+  mkdir -p "$(dirname "${venv_dir}")"
+  if ! "${python_path}" -m venv "${venv_dir}"; then
+    failed_venv="${venv_dir}.failed-$(date '+%Y%m%d-%H%M%S')"
+    if [ -e "${venv_dir}" ] || [ -L "${venv_dir}" ]; then
+      mv "${venv_dir}" "${failed_venv}"
+      printf '未完成的新环境已保留在：%s\n' "${failed_venv}" >&2
+    fi
+    if [ -n "${venv_backup}" ]; then
+      mv "${venv_backup}" "${venv_dir}"
+      printf '已将原虚拟环境恢复到：%s\n' "${venv_dir}" >&2
+    fi
+    printf '错误：无法使用 %s 创建虚拟环境。\n' "${python_path}" >&2
+    exit 1
+  fi
 else
-  printf '复用虚拟环境：%s\n' "${venv_dir}"
+  printf '复用虚拟环境：%s（Python %s）\n' \
+    "${venv_dir}" "$(python_version "${venv_dir}/bin/python")"
 fi
 
 printf '安装后端依赖…\n'
 "${venv_dir}/bin/python" -m pip install --upgrade pip setuptools wheel
-"${venv_dir}/bin/python" -m pip install -r "${PROJECT_ROOT}/requirements.txt"
+"${venv_dir}/bin/python" -m pip install --upgrade -r "${PROJECT_ROOT}/requirements.txt"
 
 if [ ! -e "${PROJECT_ROOT}/.env" ]; then
   cp "${PROJECT_ROOT}/.env.example" "${PROJECT_ROOT}/.env"

@@ -9,6 +9,7 @@ from typing import Any
 
 
 TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
+STREAM_END_STATUSES = TERMINAL_STATUSES | {"awaiting_reference"}
 
 
 def utc_now() -> str:
@@ -116,7 +117,7 @@ class JobStore:
         if unknown:
             raise ValueError(f"unsupported job fields: {sorted(unknown)}")
         if not fields:
-            return self.get_job(job_id)
+            return self.get_job(job_id, include_logs=False)
         if "result_json" in fields and not isinstance(fields["result_json"], str):
             fields["result_json"] = json.dumps(fields["result_json"], ensure_ascii=False)
         fields["updated_at"] = utc_now()
@@ -126,17 +127,70 @@ class JobStore:
             cursor = connection.execute(f"UPDATE jobs SET {assignments} WHERE id = ?", values)
             if cursor.rowcount != 1:
                 raise KeyError(job_id)
+        # Progress updates can happen once per segment.  Returning historical
+        # logs here makes a long job repeatedly fetch and serialize the same
+        # rows, turning the event path into O(number_of_updates * log_history).
+        return self.get_job(job_id, include_logs=False)
+
+    def update_settings(self, job_id: str, settings: dict[str, Any]) -> dict[str, Any]:
+        """Replace immutable-at-run settings while a terminal job is being retried."""
+
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "UPDATE jobs SET settings_json = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(settings, ensure_ascii=False), utc_now(), job_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(job_id)
         return self.get_job(job_id)
 
-    def add_log(self, job_id: str, message: str, level: str = "INFO") -> None:
+    def select_reference(self, job_id: str, settings: dict[str, Any]) -> dict[str, Any]:
+        """Atomically claim an awaiting job and persist its reference selection."""
+
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE jobs
+                SET settings_json = ?, status = 'queued',
+                    current_step = '参考片段已选择，等待继续处理',
+                    error = NULL, cancel_requested = 0, updated_at = ?
+                WHERE id = ? AND status = 'awaiting_reference'
+                """,
+                (json.dumps(settings, ensure_ascii=False), utc_now(), job_id),
+            )
+            if cursor.rowcount != 1:
+                exists = connection.execute(
+                    "SELECT 1 FROM jobs WHERE id = ?", (job_id,)
+                ).fetchone()
+                if exists is None:
+                    raise KeyError(job_id)
+                raise RuntimeError("任务已被继续或状态已变更")
+        return self.get_job(job_id, include_logs=False)
+
+    def add_log(
+        self,
+        job_id: str,
+        message: str,
+        level: str = "INFO",
+    ) -> dict[str, Any] | None:
         value = message.strip()
         if not value:
-            return
+            return None
+        timestamp = utc_now()
+        normalized_level = level.upper()
+        stored_message = value[-8000:]
         with self.connect() as connection:
-            connection.execute(
+            cursor = connection.execute(
                 "INSERT INTO job_logs(job_id, created_at, level, message) VALUES (?, ?, ?, ?)",
-                (job_id, utc_now(), level.upper(), value[-8000:]),
+                (job_id, timestamp, normalized_level, stored_message),
             )
+            log_id = int(cursor.lastrowid)
+        return {
+            "id": log_id,
+            "created_at": timestamp,
+            "level": normalized_level,
+            "message": stored_message,
+        }
 
     def get_logs(self, job_id: str, *, limit: int = 400) -> list[dict[str, Any]]:
         with self.connect() as connection:
@@ -173,7 +227,8 @@ class JobStore:
             row = connection.execute(
                 """
                 SELECT * FROM jobs
-                WHERE source_kind = ? AND source_value = ? AND status IN ('queued', 'running')
+                WHERE source_kind = ? AND source_value = ?
+                    AND status IN ('queued', 'running', 'awaiting_reference')
                 ORDER BY created_at DESC LIMIT 1
                 """,
                 (source_kind, source_value),

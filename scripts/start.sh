@@ -29,21 +29,34 @@ resolve_executable() {
   esac
 }
 
+venv_dir="$(expand_path "${VENV_DIR:-.venv}")"
 if [ -n "${PYTHON_BIN:-}" ]; then
   app_python="$(resolve_executable "${PYTHON_BIN}" || true)"
-elif [ -x "${PROJECT_ROOT}/.venv/bin/python" ]; then
-  app_python="${PROJECT_ROOT}/.venv/bin/python"
+elif [ -x "${venv_dir}/bin/python" ]; then
+  app_python="${venv_dir}/bin/python"
 else
-  app_python="$(command -v python3 2>/dev/null || true)"
+  app_python=""
 fi
 if [ -z "${app_python}" ] || [ ! -x "${app_python}" ]; then
-  printf '错误：找不到可用 Python。请先运行 ./scripts/setup.sh。\n' >&2
+  printf '错误：找不到项目虚拟环境 Python：%s/bin/python。\n' "${venv_dir}" >&2
+  printf '请在项目根目录运行 ./scripts/setup.sh。\n' >&2
+  exit 1
+fi
+app_python_version="$("${app_python}" -c 'import platform; print(platform.python_version())' 2>/dev/null || printf '未知')"
+if ! "${app_python}" -c 'import sys; raise SystemExit(sys.version_info < (3, 10))' \
+  >/dev/null 2>&1; then
+  printf '错误：当前项目 Python 为 %s（%s），最低需要 Python 3.10。\n' \
+    "${app_python_version}" "${app_python}" >&2
+  printf '新版 yt-dlp 已不再支持 Python 3.9。请运行 ./scripts/setup.sh；\n' >&2
+  printf '安装脚本会备份旧虚拟环境，再用 Python 3.10+ 重建。\n' >&2
   exit 1
 fi
 if ! "${app_python}" -c 'import fastapi, httpx, pydantic, uvicorn; import dotenv' >/dev/null 2>&1; then
-  printf '错误：后端依赖不完整。请先运行 ./scripts/setup.sh。\n' >&2
+  printf '错误：后端依赖不完整（Python %s）。请先运行 ./scripts/setup.sh。\n' \
+    "${app_python_version}" >&2
   exit 1
 fi
+printf '应用 Python：%s（%s）\n' "${app_python}" "${app_python_version}"
 
 PATH="$(dirname "${app_python}"):${PATH}"
 export PATH

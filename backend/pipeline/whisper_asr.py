@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import math
 import tempfile
 from pathlib import Path
-from typing import Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from backend.config import Settings
 from backend.models.domain import Segment, Transcript, WordTimestamp
@@ -15,6 +16,81 @@ from backend.utils.process import require_executable, run_process
 
 logger = logging.getLogger(__name__)
 LogCallback = Callable[[str], Optional[Awaitable[None]]]
+ASR_CACHE_VERSION = 1
+ASR_CACHE_METADATA_NAME = "transcript.cache.json"
+
+
+def _canonical_json_sha256(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _audio_identity(audio_path: Path) -> dict[str, int | str]:
+    """Return a bounded-memory content identity for an ASR input file."""
+
+    audio_path = audio_path.expanduser().resolve()
+    if not audio_path.is_file():
+        raise RuntimeError(f"Whisper 输入音频不存在：{audio_path}")
+    before = audio_path.stat()
+    digest = hashlib.sha256()
+    with audio_path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    after = audio_path.stat()
+    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+        raise RuntimeError(f"读取期间 Whisper 输入音频发生变化：{audio_path}")
+    return {"size": after.st_size, "sha256": digest.hexdigest()}
+
+
+def _normalized_language(language: str | None) -> str:
+    value = str(language or "auto").strip().casefold()
+    return "auto" if value in {"", "auto", "automatic"} else value
+
+
+def build_asr_cache_metadata(
+    audio_path: Path,
+    *,
+    model: str,
+    language: str,
+) -> dict[str, Any]:
+    """Describe every input which can change the normalized Whisper result."""
+
+    cache_input = {
+        "audio": _audio_identity(audio_path),
+        "model": str(model).strip(),
+        "language": _normalized_language(language),
+        "task": "transcribe",
+        "word_timestamps": True,
+    }
+    return {
+        "version": ASR_CACHE_VERSION,
+        "input": cache_input,
+        "input_fingerprint": _canonical_json_sha256(cache_input),
+    }
+
+
+def load_cached_transcript(
+    transcript_path: Path,
+    metadata_path: Path,
+    expected_metadata: dict[str, Any],
+) -> Transcript | None:
+    """Load only a transcript whose sidecar exactly matches current ASR inputs."""
+
+    if not transcript_path.is_file() or not metadata_path.is_file():
+        return None
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if metadata != expected_metadata:
+            return None
+        return Transcript.model_validate_json(transcript_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError) as exc:
+        logger.warning("[ASR] 忽略损坏的转写缓存：%s", exc)
+        return None
 
 
 class WhisperAdapter:
@@ -31,27 +107,39 @@ class WhisperAdapter:
         on_log: LogCallback | None = None,
     ) -> Transcript:
         output_dir.mkdir(parents=True, exist_ok=True)
+        audio_path = audio_path.expanduser().resolve()
         transcript_path = output_dir / "transcript.json"
+        metadata_path = output_dir / ASR_CACHE_METADATA_NAME
         original_srt = output_dir / "original.srt"
-        if transcript_path.exists():
-            try:
-                transcript = Transcript.model_validate_json(transcript_path.read_text(encoding="utf-8"))
-                if not original_srt.exists():
-                    from backend.pipeline.subtitle import write_srt
+        selected_model = str(model or self.config.whisper_model).strip()
+        requested_language = _normalized_language(language)
+        expected_metadata = build_asr_cache_metadata(
+            audio_path,
+            model=selected_model,
+            language=requested_language,
+        )
+        transcript = load_cached_transcript(
+            transcript_path,
+            metadata_path,
+            expected_metadata,
+        )
+        if transcript is not None:
+            if not original_srt.exists():
+                from backend.pipeline.subtitle import write_srt
 
-                    write_srt(
-                        transcript.segments,
-                        original_srt,
-                        translated=False,
-                        preserve_ids=False,
-                    )
-                logger.info("[ASR] 使用缓存 transcript.json")
-                return transcript
-            except Exception as exc:
-                logger.warning("[ASR] 缓存不可用，将重新识别：%s", exc)
+                write_srt(
+                    transcript.segments,
+                    original_srt,
+                    translated=False,
+                    preserve_ids=False,
+                )
+            logger.info("[ASR] 使用匹配输入指纹的 transcript.json 缓存")
+            return transcript
+        if transcript_path.exists():
+            logger.info("[ASR] 输入、模型或语言已变化，将重新识别")
 
         binary = require_executable(self.config.whisper_bin, "Whisper CLI")
-        selected_model = model or self.config.whisper_model
+
         async def relay(line: str) -> None:
             if on_log and line.strip():
                 result = on_log(line)
@@ -77,8 +165,8 @@ class WhisperAdapter:
                 "--verbose",
                 "False",
             ]
-            if language and language.lower() not in {"auto", "automatic"}:
-                args.extend(["--language", language])
+            if requested_language != "auto":
+                args.extend(["--language", requested_language])
             await run_process(args, on_line=relay)
             raw_path = raw_output_dir / f"{audio_path.stem}.json"
             if not raw_path.exists():
@@ -87,6 +175,8 @@ class WhisperAdapter:
                     raise RuntimeError("Whisper 已结束，但找不到唯一的 JSON 输出")
                 raw_path = json_files[0]
             transcript = self._normalize(json.loads(raw_path.read_text(encoding="utf-8")))
+        # Publish metadata last.  A crash between these atomic writes leaves an
+        # intentionally invalid cache instead of pairing new text with old SRT.
         atomic_write_json(transcript_path, transcript.model_dump())
         from backend.pipeline.subtitle import write_srt
 
@@ -96,6 +186,7 @@ class WhisperAdapter:
             translated=False,
             preserve_ids=False,
         )
+        atomic_write_json(metadata_path, expected_metadata)
         logger.info("[ASR] detected language=%s", transcript.language)
         logger.info("[ASR] segments=%d", len(transcript.segments))
         return transcript
